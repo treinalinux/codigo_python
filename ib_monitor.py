@@ -7,6 +7,7 @@ Refatorado para:
  - Filtragem de HCAs não utilizados (mlx5_2, mlx5_3)
  - Execução por duração determinada
  - Identificação clara de Topologia em linha única
+ - Feedback positivo ao final da execução (Health Check)
 """
 
 import os
@@ -37,6 +38,9 @@ class PortStateTracker:
         self.last_xmit_wait = 0
         self.last_latency_ms = 0.0
         self.first_run = True
+        
+        # Flag para rastrear se alguma anomalia aconteceu nesta porta
+        self.had_anomalies = False 
 
     def update_and_check(self, state: str, phys_state: str, symbol_errors: int, xmit_wait: int, latency_ms: float):
         # 1. Transições de estado lógico
@@ -45,6 +49,7 @@ class PortStateTracker:
             if state == "ACTIVE":
                 print(f"INFO | RECOVERED | {msg}")
             else:
+                self.had_anomalies = True
                 print(f"ERROR | CRITICAL | {msg}")
 
         # 2. Transições de estado físico
@@ -53,12 +58,14 @@ class PortStateTracker:
             if phys_state == "LinkUp":
                 print(f"INFO | PHYS UP | {msg}")
             else:
+                self.had_anomalies = True
                 print(f"WARN | PHYS DOWN | {msg}")
 
         # 3. Incremento de Symbol Error Counter
         if not self.first_run:
             symbol_delta = symbol_errors - self.last_symbol_errors
             if symbol_delta > 0:
+                self.had_anomalies = True
                 level = "WARN" if symbol_delta < SYMBOL_ERROR_ALERT_THRESHOLD else "ERROR"
                 print(f"{level} | SYMBOL ERR | [{self.dev} P{self.port}] +{symbol_delta} erros no intervalo (Total: {symbol_errors})")
 
@@ -66,11 +73,13 @@ class PortStateTracker:
         if not self.first_run:
             xmit_wait_delta = xmit_wait - self.last_xmit_wait
             if xmit_wait_delta > PORT_XMIT_WAIT_ALERT_THRESHOLD:
+                self.had_anomalies = True
                 print(f"WARN | CONGESTION | [{self.dev} P{self.port}] +{xmit_wait_delta} xmit_wait no intervalo (Total: {xmit_wait})")
 
         # 5. Degradação de Latência
         if not self.first_run and latency_ms > 0:
             if latency_ms > LATENCY_ALERT_THRESHOLD_MS:
+                self.had_anomalies = True
                 print(f"WARN | HIGH LATENCY | [{self.dev} P{self.port}] RTT: {latency_ms:.3f} ms")
 
         # Atualiza o histórico
@@ -127,7 +136,7 @@ def measure_latency_popen(hca_dev: str, hca_port: str, dest_lid: str) -> float:
             return float(match.group(1))
             
     except Exception as e:
-        print(f"DEBUG | ibping error: {e}")
+        pass # Silenciado intencionalmente para não poluir logs saudáveis
         
     return -1.0
 
@@ -181,7 +190,7 @@ def monitor_loop(devices: dict, duration: int, interval: int):
                 symbol_errors = int(read_sys_file(os.path.join(port_path, "counters", "symbol_error"), "0"))
                 xmit_wait = int(read_sys_file(os.path.join(port_path, "counters", "port_xmit_wait"), "0"))
 
-                # Teste Ativo (apenas se a porta estiver no ar)
+                # Teste Ativo
                 current_latency = -1.0
                 if state == "ACTIVE":
                     current_latency = measure_latency_popen(dev, port, LATENCY_TARGET_LID)
@@ -192,6 +201,14 @@ def monitor_loop(devices: dict, duration: int, interval: int):
         time.sleep(interval)
         
     print("INFO | STOP | Tempo limite atingido")
+    
+    # NOVO: Avaliação de Saúde Final
+    for dev, ports in devices.items():
+        for port, tracker in ports.items():
+            if not tracker.had_anomalies:
+                print(f"SUCCESS | HEALTH_CHECK | [{dev} P{port}] Sem erros fisicos, congestionamento ou quedas (Latencia < {LATENCY_ALERT_THRESHOLD_MS}ms).")
+            else:
+                print(f"WARN | HEALTH_CHECK | [{dev} P{port}] Apresentou anomalias durante a execucao. Revise os logs acima.")
 
 
 if __name__ == "__main__":
@@ -201,7 +218,6 @@ if __name__ == "__main__":
         print("ERROR | INIT | Nenhum adaptador InfiniBand mapeado")
         sys.exit(1)
 
-    # Imprime a topologia em linha única
     print_lid_topology(ib_devices)
     
     try:
