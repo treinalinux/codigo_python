@@ -1,108 +1,156 @@
 #!/usr/bin/env python3
 """
 Leitor Humano de Relatórios ibdiagnet (RHEL 8 / Mellanox)
-Filtra o log denso gerado pelo ibdiagnet, identifica o Master Subnet Manager
-e exibe apenas os erros críticos que exigem intervenção.
+Versão Assistente: Parseamento inteligente e manuais de mitigação NVIDIA integrados.
 """
 
 import os
 import sys
+import time
+import re
 
-# Caminho padrão onde o ibdiagnet salva o log principal
 LOG_FILE = "/var/tmp/ibdiagnet2/ibdiagnet2.log"
+
+def extract_node_info(line):
+    """Tenta extrair Nome e LID das linhas complexas do ibdiagnet usando Regex."""
+    name_match = re.search(r'Node Name:\s*([^,]+)', line)
+    lid_match = re.search(r'LID:\s*(\d+)', line)
+    
+    if name_match and lid_match:
+        name = name_match.group(1).strip()
+        lid = lid_match.group(1)
+        return f"{name} (LID: {lid})"
+    
+    return line.split(":", 1)[-1].strip() if ":" in line and line.startswith("-") else line
+
 
 def analyze_ibdiagnet_log():
     if not os.path.exists(LOG_FILE):
         print(f"ERRO | Arquivo não encontrado: {LOG_FILE}")
-        print("DICA | Execute o comando 'ibdiagnet' como root para gerar o relatório atualizado antes de rodar este script.")
+        print("DICA | Execute 'sudo ibdiagnet' para gerar um novo relatório.")
         sys.exit(1)
 
-    # Armazena os erros encontrados
-    duplications = set()
-    routing = set()
-    downgrades = set()
-    general_errors = set()
-    
-    # Variável para armazenar quem é o switch principal (SM)
-    master_sm_info = "Não localizado no log (O Subnet Manager pode estar inativo ou o log está incompleto!)"
+    file_mtime = os.path.getmtime(LOG_FILE)
+    run_date = time.strftime('%d/%m/%Y às %H:%M:%S', time.localtime(file_mtime))
 
-    print(f"Lendo relatório da fabric gerado em: {LOG_FILE}")
-    print("=" * 80)
+    duplications, routing, downgrades, general_errors = set(), set(), set(), set()
+    master_sms, standby_sms = [], []
 
     # Leitura e parsing do arquivo
     with open(LOG_FILE, 'r') as file:
         for line in file:
             line = line.strip()
+            lower_line = line.lower()
             
-            # 1. Identificar o Master Subnet Manager (Linhas de Informação -I-)
-            if "-I-" in line and "Master SM" in line:
-                # Extrai apenas a informação limpa sobre o SM
-                master_sm_info = line.split("-I-", 1)[-1].strip()
+            if "master sm" in lower_line:
+                master_sms.append(extract_node_info(line))
+            elif "standby sm" in lower_line:
+                standby_sms.append(extract_node_info(line))
 
-            # 2. Filtragem de Erros (-E-) e Alertas (-W-)
             is_error = "-E-" in line
             is_warning = "-W-" in line
 
             if is_error or is_warning:
-                # Limpa a linha mantendo apenas a mensagem real
-                if is_error:
-                    clean_line = line.split("-E-", 1)[-1].strip()
-                else:
-                    clean_line = line.split("-W-", 1)[-1].strip()
-                
-                lower_line = clean_line.lower()
+                clean_line = line.split("-E-", 1)[-1].strip() if is_error else line.split("-W-", 1)[-1].strip()
+                lower_clean = clean_line.lower()
 
-                # Categorização baseada em palavras-chave vitais do InfiniBand
-                if "duplicate" in lower_line or "dup " in lower_line:
+                if "duplicate" in lower_clean or "dup " in lower_clean:
                     duplications.add(clean_line)
-                
-                elif "routing" in lower_line or "unreach" in lower_line:
+                elif "routing" in lower_clean or "unreach" in lower_clean:
                     routing.add(clean_line)
-                
-                elif "downgrade" in lower_line:
+                elif "downgrade" in lower_clean:
                     downgrades.add(clean_line)
-                
                 elif is_error:
                     general_errors.add(clean_line)
 
-    # Exibição do Master SM no topo do relatório
-    print("👑 GERÊNCIA DA REDE (SUBNET MANAGER):")
-    print(f"  -> {master_sm_info}")
+    # ==========================================
+    # SAÍDA FORMATADA (TELA)
+    # ==========================================
+    print("\n" + "=" * 80)
+    print(f"📊 RELATÓRIO DE SAÚDE DA MALHA INFINIBAND")
+    print(f"🕒 Gerado pelo ibdiagnet em: {run_date}")
+    print("=" * 80)
+
+    print("\n👑 CÉREBRO DA REDE (SUBNET MANAGERS):")
+    if master_sms:
+        for sm in master_sms:
+            print(f"  -> MASTER  : {sm}")
+    else:
+        print("  -> MASTER  : [ALERTA CRÍTICO] Não localizado! Roteamento pode estar offline.")
+
+    if standby_sms:
+        for sm in standby_sms:
+            print(f"  -> STANDBY : {sm}")
     print("-" * 80)
 
-    # Função auxiliar para imprimir os blocos de erro
-    def print_block(title, items):
+    total_issues = len(duplications) + len(routing) + len(downgrades) + len(general_errors)
+    
+    if total_issues == 0:
+        print("\n✅ STATUS GERAL: EXCELENTE")
+        print("  A malha está perfeitamente saudável. Nenhum erro de roteamento,")
+        print("  duplicação de GUID/LID ou rebaixamento físico de cabos detectado.")
+        print("=" * 80 + "\n")
+        sys.exit(0)
+    
+    print(f"\n⚠️ STATUS GERAL: ATENÇÃO REQUERIDA ({total_issues} anomalias detectadas)")
+
+    def print_block(title, items, action_lines):
         if items:
-            print(f"\n{title}")
+            print(f"\n{title} ({len(items)} ocorrências):")
             items_list = list(items)
             for item in items_list[:10]:
-                print(f"  -> {item}")
+                print(f"  - {item}")
             if len(items_list) > 10:
-                print(f"  ... e mais {len(items_list) - 10} ocorrências similares (Ver log completo).")
-            return True
-        return False
+                print(f"  ... e mais {len(items_list) - 10} similares (Consulte o log original).")
+            
+            print("\n  💡 MANUAL DE MITIGAÇÃO NVIDIA:")
+            for action in action_lines:
+                print(f"     {action}")
 
-    # Exibição Estruturada dos Erros
-    has_issues = False
+    # --- Dicas Oficiais NVIDIA/Mellanox ---
     
-    if print_block("🚨 [CRÍTICO] Duplicações de Identificadores (GUID/LID):", duplications):
-        has_issues = True
-        
-    if print_block("🚨 [CRÍTICO] Falhas de Roteamento / Nós Inalcançáveis:", routing):
-        has_issues = True
-        
-    if print_block("⚠️  [ALERTA] Degradação Física (Cabos operando abaixo da velocidade):", downgrades):
-        has_issues = True
-        
-    if print_block("⚠️  [ALERTA] Outros Erros Críticos Identificados:", general_errors):
-        has_issues = True
+    print_block(
+        "🚨 DUPLICAÇÃO DE IDENTIFICADORES (GUID/LID)", 
+        duplications, 
+        [
+            "1. Identifique a porta física do nó problemático na lista acima.",
+            "2. Acesse via SSH o switch MLNX-OS onde essa porta está conectada.",
+            "3. Isole a porta administrativamente (Comandos: 'interface ib 1/x' -> 'shutdown') para estabilizar a malha.",
+            "4. Verifique se há hypervisors clonando vGUIDs idênticos em VMs ou troque o HCA do servidor afetado."
+        ]
+    )
+    
+    print_block(
+        "🚨 FALHAS DE ROTEAMENTO (Routing / Unreachable)", 
+        routing, 
+        [
+            "1. Acesse via SSH o switch listado como MASTER SM no topo deste relatório.",
+            "2. Force um recálculo total da malha (Heavy Sweep) reiniciando o serviço OpenSM.",
+            "   (Comandos MLNX-OS: execute 'no ib sm' aguarde 3 segundos, e execute 'ib sm').",
+            "3. Se persistir, valide se o algoritmo de roteamento ('show ib sm') suporta sua topologia (ex: minhop vs fattree)."
+        ]
+    )
+    
+    print_block(
+        "⚠️ DEGRADAÇÃO FÍSICA (Link Downgrade)", 
+        downgrades, 
+        [
+            "1. A porta negociou abaixo da velocidade nominal (ex: 1X ao invés de 4X) devido a corrupção de sinal.",
+            "2. Tente um reset lógico pelo RHEL 8: execute 'ibportstate <LID> <PORTA> reset'.",
+            "3. Se a velocidade não restaurar, a falha é física: remova o cabo MPO, utilize a caneta de limpeza óptica",
+            "   nas fibras e transceivers QSFP. Falhando a limpeza, substitua o cabo AOC/DAC/Fibra."
+        ]
+    )
+    
+    print_block(
+        "⚠️ OUTROS ERROS CRÍTICOS", 
+        general_errors, 
+        [
+            "Inspecione manualmente o arquivo /var/tmp/ibdiagnet2/ibdiagnet2.log para coletar o contexto exato."
+        ]
+    )
 
-    # Feedback Positivo se a rede estiver limpa
-    if not has_issues:
-        print("\nSUCCESS | HEALTH_CHECK | A malha InfiniBand está saudável!")
-        print("Nenhum erro de roteamento, duplicação de GUID/LID ou degradação física encontrado.")
-
-    print("\n" + "=" * 80)
+    print("\n" + "=" * 80 + "\n")
 
 if __name__ == "__main__":
     analyze_ibdiagnet_log()
